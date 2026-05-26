@@ -9,6 +9,11 @@ import time # Import time for potential future use
 import sqlite3
 import argparse # Add argparse
 
+# Module-level flags set in __main__ after argparse. Defaults are the safe-no-op values
+# so import-time uses of the helpers (e.g. by tests) don't blow up if these are missing.
+DRY_RUN: bool = False           # if True, suppress Immich write API calls
+RATE_LIMIT_SEC: float = 0.0     # sleep between per-asset write calls
+
 # --- Helper Functions ---
 
 def get_text_embeddings(texts: list[str], ml_api_url: str, clip_model: str) -> dict[str, np.ndarray] | None:
@@ -55,8 +60,10 @@ def get_text_embeddings(texts: list[str], ml_api_url: str, clip_model: str) -> d
                  # Decide if this is fatal? For now, let's allow it but warn.
             
             embeddings_map[text_input] = embedding
-            # Add a small delay to avoid overwhelming the ML service? 
-            # time.sleep(0.1)
+            # Rate-limit between ML calls (configured via --rate-limit-ms / RATE_LIMIT_MS env).
+            # No-op when RATE_LIMIT_SEC == 0.
+            if RATE_LIMIT_SEC > 0:
+                time.sleep(RATE_LIMIT_SEC)
             
         except requests.exceptions.RequestException as e:
             print(f"Error contacting ML service at {endpoint} for '{text_input}': {e}")
@@ -115,6 +122,11 @@ def get_immich_album_id(api_url: str, api_key: str, album_name: str) -> str | No
 
 def add_asset_to_immich_album(api_url: str, api_key: str, asset_id: str, album_id: str) -> bool:
     """Adds an asset to a specific Immich album."""
+    if DRY_RUN:
+        print(f"  [DRY-RUN] would add asset {asset_id} → album {album_id}")
+        return True
+    if RATE_LIMIT_SEC > 0:
+        time.sleep(RATE_LIMIT_SEC)
     endpoint = f"{api_url.rstrip('/')}/albums/{album_id}/assets"
     headers = {'x-api-key': api_key, 'Content-Type': 'application/json'}
     payload = {"ids": [asset_id]}
@@ -157,6 +169,11 @@ def visibility_immich_asset(api_url: str, api_key: str, asset_id: str, action: s
     Returns:
         bool: True if the update was successful, False otherwise
     """
+    if DRY_RUN:
+        print(f"  [DRY-RUN] would set visibility {action} on asset {asset_id}")
+        return True
+    if RATE_LIMIT_SEC > 0:
+        time.sleep(RATE_LIMIT_SEC)
     endpoint = f"{api_url.rstrip('/')}/assets"
     headers = {'x-api-key': api_key, 'Content-Type': 'application/json'}
     payload = {
@@ -206,7 +223,21 @@ if __name__ == "__main__":
                         help="Perform a full scan of all unarchived assets, ignoring timestamps and previously processed IDs.")
     parser.add_argument("--ignore-completed", action="store_true",
                         help="Reprocess assets even if they are already in the processed IDs database.")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Compute matches and print intended actions but do NOT call Immich write APIs (album add / archive). Safe rehearsal mode for new keyword thresholds.")
+    parser.add_argument("--rate-limit-ms", type=int, default=int(os.getenv("RATE_LIMIT_MS", "100")),
+                        help="Milliseconds to sleep between per-asset Immich-write calls. Default 100ms (10 calls/sec). Env override: RATE_LIMIT_MS.")
     args = parser.parse_args()
+
+    # Module-level flags consumed inside the API helper functions below.
+    # Use globals so we don't have to thread them through every helper call.
+    global DRY_RUN, RATE_LIMIT_SEC
+    DRY_RUN = args.dry_run
+    RATE_LIMIT_SEC = max(0, args.rate_limit_ms) / 1000.0
+    if DRY_RUN:
+        print("=" * 60)
+        print("DRY-RUN MODE: no album-add or visibility-change API calls will be made.")
+        print("=" * 60)
     
     # Load environment variables
     load_dotenv()
@@ -216,6 +247,7 @@ if __name__ == "__main__":
     immich_api_key = os.getenv("IMMICH_API_KEY")
     db_name = os.getenv("DB_NAME")
     db_user = os.getenv("DB_USER")
+    db_password = os.getenv("DB_PASSWORD")  # optional; if unset, falls back to peer auth via Unix socket
     db_host = os.getenv("DB_HOST")
     db_port = os.getenv("DB_PORT")
     ml_api_url = os.getenv("ML_API_URL")
@@ -298,21 +330,21 @@ if __name__ == "__main__":
         # ----------------------------------------------
         
         # --- PostgreSQL Connection & Fetch ---
-        # Option B: Attempt connection via Unix domain socket (like psql does)
-        # This might work with peer authentication if run as the 'immich' OS user
-        # Requires DB_USER='immich' in .env, DB_PASSWORD might be irrelevant/empty
-        # Common socket directories: /run/postgresql, /var/run/postgresql, /tmp
-        # psycopg2 might automatically find it if host/port are omitted
-        print("Attempting database connection via Unix socket...")
-        conn = psycopg2.connect(
-            dbname=db_name,
-            user=db_user,
-            # password=db_password, # Comment out or remove password for peer auth trial
-            # host=db_host, # Omit host to encourage socket connection
-            # port=db_port # Omit port
-        )
+        # Two paths supported:
+        #   A) DB_PASSWORD set in .env → password auth over TCP to DB_HOST:DB_PORT
+        #      (works for Immich running in Docker, where the postgres Unix socket is
+        #      inside the container and not visible to this script's process).
+        #   B) DB_PASSWORD unset → connect via Unix socket with peer auth, requires
+        #      this script to run as the OS user the DB user maps to.
+        connect_kwargs = {"dbname": db_name, "user": db_user}
+        if db_password:
+            connect_kwargs.update({"password": db_password, "host": db_host, "port": db_port})
+            print(f"Connecting to Postgres at {db_host}:{db_port} as {db_user} (password auth)...")
+        else:
+            print("Attempting database connection via Unix socket (peer auth)...")
+        conn = psycopg2.connect(**connect_kwargs)
         cur = conn.cursor()
-        print("Database connection successful (via socket).")
+        print("Database connection successful.")
 
         # Fetch assets from DB
         # Use timezone-aware UTC now
