@@ -53,11 +53,17 @@ def get_text_embeddings(texts: list[str], ml_api_url: str, clip_model: str) -> d
             
             embedding = np.array(embedding_list, dtype=np.float32)
 
-            # Basic validation of embedding dimensions (adjust if needed)
-            expected_dim = 1024 
-            if embedding.shape[0] != expected_dim: 
-                 print(f"Warning: ML service returned embedding with unexpected shape (Expected {expected_dim}) for '{text_input}': {embedding.shape}")
-                 # Decide if this is fatal? For now, let's allow it but warn.
+            # Embedding dimension varies by CLIP model:
+            #   ViT-B-32__openai       → 512
+            #   ViT-L-14__openai       → 768
+            #   ViT-L-16-SigLIP-384    → 1152
+            #   ViT-SO400M-16-SigLIP2-384 → 1152
+            # No need to check against a hardcoded value — the cosine_similarity
+            # helper guards against shape mismatch between text and image embeddings,
+            # and Immich's smart_search table stores at whatever dim the configured
+            # model produces. Just record what we got on first call.
+            if len(embeddings_map) == 0:
+                print(f"  Embedding dimension from ML service: {embedding.shape[0]}")
             
             embeddings_map[text_input] = embedding
             # Rate-limit between ML calls (configured via --rate-limit-ms / RATE_LIMIT_MS env).
