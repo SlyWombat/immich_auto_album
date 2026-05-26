@@ -230,8 +230,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # Module-level flags consumed inside the API helper functions below.
-    # Use globals so we don't have to thread them through every helper call.
-    global DRY_RUN, RATE_LIMIT_SEC
+    # This block is at top-level (inside __main__), so assignments here are
+    # module-level by definition — no `global` needed (and `global` would
+    # conflict with the annotated declarations near the top of the file).
     DRY_RUN = args.dry_run
     RATE_LIMIT_SEC = max(0, args.rate_limit_ms) / 1000.0
     if DRY_RUN:
